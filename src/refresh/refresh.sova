@@ -280,3 +280,27 @@ func list(cfg: Config, subject: string): []Record {
     }
     return cfg.store!.listByUser(subject)
 }
+
+/// revoke marks the record identified by `presented` as revoked
+/// without minting a replacement. Use inside sign-out handlers so
+/// the browser cannot silently rehydrate after the user pressed the
+/// logout button.
+///
+/// Returns true when the token matched a live record and the Store
+/// confirmed the update; false when the token is unknown, already
+/// revoked, or the Store failed.
+///
+/// @param cfg the refresh configuration
+/// @param presented the plaintext refresh token the client sent
+/// @returns true when the record was successfully revoked
+func revoke(cfg: Config, presented: string): bool {
+    if cfg.store == none {
+        return false
+    }
+    let store = cfg.store!
+    let found = store.findByHash(crypto.sha256(presented))
+    if found == none {
+        return false
+    }
+    return store.markRevoked(found!.id)
+}

@@ -214,10 +214,11 @@ func tryRotate(kit: Kit, req: http.Request): option<refresh.TokenAndRecord> {
 }
 
 /// revokeCurrentDevice is the sign-out building block. Given the
-/// refresh token the client just presented, it revokes that
-/// device's Record so the browser cannot silently reauth. The
-/// caller still needs to call `@.logout()` and attach a cleared
-/// refresh cookie in the same response.
+/// refresh token the client just presented, it revokes that record
+/// without minting a replacement so the browser cannot silently
+/// rehydrate. The caller still needs to call `@.logout()` and
+/// attach a cleared refresh cookie (see `clearRefreshCookieOpts`)
+/// in the same response.
 ///
 /// Best-effort: on any Store error the function silently returns.
 ///
@@ -227,5 +228,5 @@ func revokeCurrentDevice(kit: Kit, presentedRefreshToken: string) {
     if presentedRefreshToken == "" {
         return
     }
-    refresh.rotate(kit.cfg.refresh, presentedRefreshToken)
+    refresh.revoke(kit.cfg.refresh, presentedRefreshToken)
 }
