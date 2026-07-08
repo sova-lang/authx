@@ -2,6 +2,7 @@ package authx/server on backend
 
 import "authx"
 import "authx/refresh"
+import "sessions"
 import "std/http"
 
 /// KitConfig groups the server-side knobs the application chooses
@@ -332,9 +333,9 @@ func tryRotate(kit: Kit, req: http.Request): option<refresh.TokenAndRecord> {
 /// revokeCurrentDevice is the sign-out building block. Given the
 /// refresh token the client just presented, it revokes that record
 /// without minting a replacement so the browser cannot silently
-/// rehydrate. The caller still needs to call `@.logout()` and
-/// attach a cleared refresh cookie (see `clearRefreshCookieOpts`)
-/// in the same response.
+/// rehydrate. The caller still needs to call `authx.logout(@)` (or
+/// `@.logout()`) and attach a cleared refresh cookie in the same
+/// response.
 ///
 /// Best-effort: on any Store error the function silently returns.
 ///
@@ -345,4 +346,195 @@ func revokeCurrentDevice(kit: Kit, presentedRefreshToken: string) {
         return
     }
     refresh.revoke(kit.cfg.refresh, presentedRefreshToken)
+}
+
+/// authenticate populates the given wire session with the identity
+/// carried by `principal`. Convenience wrapper around
+/// `session.authenticate(subject, claims)` so a handler can compose
+/// the call fluently with other authx helpers.
+///
+/// Sova wire handlers expose the current session as `@`. Pass `@`
+/// straight in - it is of type `sessions.Session`:
+///
+/// ```sova
+/// server.authenticate(@, principal)
+/// ```
+///
+/// The two-call equivalent inside a wire handler is
+/// `@.authenticate(principal.subject, principal.claims)`. This
+/// wrapper exists so `authx` can own the sign-in orchestration
+/// even though it cannot itself reference `@`.
+///
+/// @param session the wire session (typically `@`)
+/// @param principal identifies the authenticated user
+func authenticate(session: sessions.Session, principal: authx.Principal) {
+    session.authenticate(principal.subject, principal.claims)
+}
+
+/// setRoles replaces the wire session's active role set. Convenience
+/// wrapper around `session.setRoles(roles)` so role assignment can
+/// share the same `authx.X(@, ...)` call shape as the rest of the
+/// server helpers.
+///
+/// @param session the wire session (typically `@`)
+/// @param roles the roles to assign
+func setRoles(session: sessions.Session, roles: []string) {
+    session.setRoles(roles)
+}
+
+/// logout clears the wire session's identity, claims, and roles.
+/// Convenience wrapper around `session.logout()`.
+///
+/// This does not revoke the refresh Record - pair with
+/// `revokeCurrentDevice` (or `completeSignOut` which does both) so
+/// the browser cannot silently rehydrate after the user signs out.
+///
+/// @param session the wire session (typically `@`)
+func logout(session: sessions.Session) {
+    session.logout()
+}
+
+/// completeSignIn is the composed convenience for a sign-in handler.
+/// It mints a fresh refresh token via `mintRefresh`, populates the
+/// wire session via `session.authenticate`, and returns the
+/// plaintext refresh token so the caller can attach it to the
+/// response cookie.
+///
+/// Returns `""` on any Store failure. In that case the session is
+/// NOT authenticated, so the caller should surface an internal
+/// error to the user rather than proceeding as if signIn had
+/// succeeded.
+///
+/// The two-call equivalent, if the caller wants more control:
+///
+/// ```sova
+/// let token = server.mintRefresh(kit, principal, deviceLabel)
+/// if token != "" {
+///     server.authenticate(@, principal)
+/// }
+/// ```
+///
+/// @param session the wire session (typically `@`)
+/// @param kit the server Kit
+/// @param principal identifies the freshly-authenticated user
+/// @param deviceLabel human-readable device label for `listDevices`
+/// @returns plaintext refresh token, or "" on failure
+func completeSignIn(session: sessions.Session, kit: Kit, principal: authx.Principal, deviceLabel: string): string {
+    let token = mintRefresh(kit, principal, deviceLabel)
+    if token == "" {
+        return ""
+    }
+    session.authenticate(principal.subject, principal.claims)
+    return token
+}
+
+/// completeSignOut is the composed convenience for a sign-out
+/// handler. Revokes the presented refresh Record (best-effort) and
+/// calls `session.logout()`. The caller still needs to attach a
+/// cleared refresh cookie to the response - use `clearRefreshCookie`
+/// for raw wires or `clearRefreshCookieOpts` for typed wires.
+///
+/// @param session the wire session (typically `@`)
+/// @param kit the server Kit
+/// @param presentedRefreshToken the token value from the cookie ("" ok)
+func completeSignOut(session: sessions.Session, kit: Kit, presentedRefreshToken: string) {
+    revokeCurrentDevice(kit, presentedRefreshToken)
+    session.logout()
+}
+
+/// completeRefresh is the composed convenience for a silent-refresh
+/// handler. It reads the presented refresh cookie via `tryRotate`,
+/// asks the caller-supplied `materialise` callback to hydrate a
+/// fresh `Principal` from the rotated Record (looking the user up
+/// in the application database), populates the wire session, and
+/// returns the new plaintext refresh token so the caller can
+/// attach it to the response cookie.
+///
+/// Returns `""` when the cookie is missing, rotation failed, or
+/// `materialise` returned an anonymous Principal (i.e. the user
+/// backing the token no longer exists - in which case authx
+/// additionally revokes the device's active tokens so the browser
+/// cannot keep hammering the refresh endpoint).
+///
+/// ```sova
+/// wire(authn: false, transport: "raw", method: "POST",
+///      path: "/api/authx/refresh")
+/// func doRefresh(req: http.Request, res: http.Response) {
+///     let token = server.completeRefresh(@, kit, req,
+///         func(rec: refresh.Record): authx.Principal {
+///             let user = db.findUserById(rec.subject)
+///             if user == none { return new authx.Principal() }
+///             let p = new authx.Principal()
+///             p.subject = user!.id
+///             p.deviceId = rec.deviceId
+///             p.claims = user!.claims
+///             return p
+///         })
+///     if token == "" {
+///         res.setStatus(401)
+///         return
+///     }
+///     server.attachRefreshCookie(kit, res, token)
+///     res.setStatus(200)
+/// }
+/// ```
+///
+/// @param session the wire session (typically `@`)
+/// @param kit the server Kit
+/// @param req the raw-wire request
+/// @param materialise callback that turns a rotated Record into a fresh Principal
+/// @returns new plaintext refresh token, or "" on any failure
+func completeRefresh(session: sessions.Session, kit: Kit, req: http.Request, materialise: func(refresh.Record): authx.Principal): string {
+    let outcome = tryRotate(kit, req)
+    if outcome == none {
+        return ""
+    }
+    let bundle = outcome!
+    let principal = materialise(bundle.record)
+    if authx.isAnonymous(principal) {
+        refresh.revokeByDevice(kit.cfg.refresh, bundle.record.subject, bundle.record.deviceId)
+        return ""
+    }
+    session.authenticate(principal.subject, principal.claims)
+    return bundle.token
+}
+
+/// attachRefreshCookie writes the refresh cookie onto a raw-wire
+/// `http.Response`, using the Kit's configured name, path, domain,
+/// secure, sameSite, and maxAge. This is the raw-wire equivalent
+/// of `Status<T>.setCookie(refreshCookieName(kit), token, refreshCookieOpts(kit))`
+/// used inside typed wires.
+///
+/// @param kit the server Kit
+/// @param res the raw-wire response
+/// @param token the plaintext refresh token to attach
+func attachRefreshCookie(kit: Kit, res: http.Response, token: string) {
+    res.setCookie(
+        kit.cfg.cookieName,
+        token,
+        kit.cfg.cookieMaxAgeSeconds,
+        true,
+        kit.cfg.cookieSecure,
+        kit.cfg.cookieSameSite,
+        kit.cfg.cookiePath
+    )
+}
+
+/// clearRefreshCookie writes an expired refresh cookie onto a
+/// raw-wire `http.Response` so the browser deletes it. Use inside
+/// sign-out handlers. Raw-wire equivalent of `Status<T>.setCookie`
+/// with `clearRefreshCookieOpts(kit)`.
+///
+/// @param kit the server Kit
+/// @param res the raw-wire response
+func clearRefreshCookie(kit: Kit, res: http.Response) {
+    res.setCookie(
+        kit.cfg.cookieName,
+        "",
+        -1,
+        true,
+        kit.cfg.cookieSecure,
+        kit.cfg.cookieSameSite,
+        kit.cfg.cookiePath
+    )
 }

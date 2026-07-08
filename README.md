@@ -33,7 +33,7 @@ making assumptions about the shape of your user table.
 |-----------------|----------|------------------------------------------------------------------------------|
 | `authx`         | shared   | `Principal`, `TokenPair`, `isAnonymous` - types shared across the boundary   |
 | `authx/refresh` | backend  | `Record`, `Store` interface, `Config`, `issue` / `rotate` / `revoke` / `list`|
-| `authx/server`  | backend  | `Kit`, fluent `Builder`, cookie helpers, `mintRefresh` / `tryRotate`         |
+| `authx/server`  | backend  | `Kit`, fluent `Builder`, session wrappers, cookie helpers, flow primitives   |
 | `authx/client`  | frontend | `install` / `installWith` for silent-refresh via `std/rpc`                    |
 
 Each sub-package can be imported on its own - a service that only needs
@@ -96,16 +96,16 @@ The `Builder` is the recommended entry point. Chain zero or more
 setters, call `.build()`:
 
 ```sova
-import "authx/server" as auth
+import "authx/server"
 
-let kit = auth.builder(new PgStore())
+let kit = server.builder(new PgStore())
     .refreshTtl(60 * 60 * 24 * 30)   // 30 days (the default)
     .cookieSecure(true)               // false only for localhost dev
     .cookieSameSite("Lax")
     .build()
 ```
 
-Every setter is optional. `builder(store).build()` is a valid config.
+Every setter is optional. `server.builder(store).build()` is a valid config.
 
 ### 3. Write the three wire handlers
 
@@ -115,12 +115,20 @@ the error semantics, the logging, and the additional business logic
 (rate limiting, MFA, audit trails). The handlers below are what a
 typical setup looks like.
 
-**Sign-in.** Verify credentials, mint a refresh token, populate Sova's
-session via `@.authenticate(...)`, attach the refresh cookie.
+The Sova wire session (`@`) is of type `sessions.Session` - a
+built-in package. That means authx can accept `@` as a plain
+function argument (`session: sessions.Session`) and drive the
+session on your behalf. The three convenience wrappers below
+(`completeSignIn`, `completeSignOut`, `completeRefresh`) do exactly
+this: you hand them `@`, they orchestrate the mint / rotate / revoke
+plus session update in one call.
+
+**Sign-in.** Verify credentials, then `completeSignIn` mints the
+refresh token AND populates the Sova session in one call.
 
 ```sova
 import "authx"
-import "authx/server" as auth
+import "authx/server"
 import "std/http"
 import "std/password"
 import "std/uuid"
@@ -138,72 +146,67 @@ func signIn(email: string, plaintext: string): http.Status<SignInResult> {
     p.deviceId = uuid.v4()
     p.claims = { "email": u.email, "roles": u.roles }
 
-    let token = auth.mintRefresh(kit, p, "browser")
+    let token = server.completeSignIn(@, kit, p, "browser")
     if token == "" {
         return errResult(500, "internal error")
     }
-
-    // Populate Sova session so subsequent wire(authn: true) accept the
-    // request. Must live in the wire body; authx cannot call `@` on
-    // your behalf because `@` is only legal inside wire handlers.
-    @.authenticate(p.subject, p.claims)
-    @.setRoles(u.roles)
+    server.setRoles(@, u.roles)
 
     let r = new http.Status<SignInResult>()
     r.body = SignInResult { ok: true }
     r.status = 200
-    r.setCookie(auth.refreshCookieName(kit), token, auth.refreshCookieOpts(kit))
+    r.setCookie(server.refreshCookieName(kit), token, server.refreshCookieOpts(kit))
     return r
 }
 ```
 
 **Refresh.** Raw wire because we need to read the refresh cookie off
-the request. Rotates the cookie and re-authenticates the session.
+the request. `completeRefresh` rotates, calls the materialiser
+callback so you can rebuild the Principal from your current DB state,
+populates the Sova session, and returns the new token.
 
 ```sova
 wire(authn: false, transport: "raw", method: "POST", path: "/api/authx/refresh")
 func refreshEndpoint(req: http.Request, res: http.Response) {
-    let outcome = auth.tryRotate(kit, req)
-    if outcome == none {
+    let token = server.completeRefresh(@, kit, req,
+        func(rec: refresh.Record): authx.Principal {
+            let user = findUserById(rec.subject)
+            if user == none { return new authx.Principal() }
+            let u = user!
+            let p = new authx.Principal()
+            p.subject = u.id
+            p.deviceId = rec.deviceId
+            p.claims = { "email": u.email, "roles": u.roles }
+            return p
+        })
+    if token == "" {
         res.setStatus(401)
         return
     }
-    let bundle = outcome!
-
-    // Materialise a fresh Principal - claims may have changed since
-    // the token was originally minted.
-    let user = findUserById(bundle.record.subject)
-    if user == none {
-        res.setStatus(401)
-        return
-    }
-    let u = user!
-    let claims = { "email": u.email, "roles": u.roles }
-
-    @.authenticate(u.id, claims)
-    @.setRoles(u.roles)
-
-    res.setCookie(
-        auth.refreshCookieName(kit), bundle.token,
-        2592000, true, true, "Lax", "/"
-    )
+    server.attachRefreshCookie(kit, res, token)
     res.setStatus(200)
 }
 ```
 
-**Sign-out.** Revoke the current device's refresh record, clear the
-Sova session, drop the refresh cookie.
+**Sign-out.** `completeSignOut` revokes the current device's refresh
+record AND calls `session.logout()`. Then drop the cookie via the
+raw-wire helper.
 
 ```sova
 wire(authn: true, transport: "raw", method: "POST", path: "/api/signOut")
 func signOutEndpoint(req: http.Request, res: http.Response) {
-    let presented = auth.readRefreshFromRequest(kit, req)
-    auth.revokeCurrentDevice(kit, presented)
-    @.logout()
-    res.setCookie(auth.refreshCookieName(kit), "", -1, true, true, "Lax", "/")
+    let presented = server.readRefreshFromRequest(kit, req)
+    server.completeSignOut(@, kit, presented)
+    server.clearRefreshCookie(kit, res)
     res.setStatus(204)
 }
 ```
+
+If you prefer to keep the mint / rotate / revoke steps separate from
+the session update, `mintRefresh`, `tryRotate`, `revokeCurrentDevice`
+are still exported. Pair them with `server.authenticate(@, ...)` /
+`server.logout(@)` and you get the same result at a lower level of
+abstraction.
 
 ### 4. Install the frontend interceptor
 
@@ -211,10 +214,10 @@ One line at frontend boot. Every wire call that comes back with a 401
 now silently POSTs to `/api/authx/refresh` and retries on success.
 
 ```sova
-import "authx/client" as authClient
+import "authx/client"
 
 func boot() {
-    authClient.install("/api/authx/refresh")
+    client.install("/api/authx/refresh")
     // ... rest of your app's boot
 }
 ```
@@ -222,7 +225,7 @@ func boot() {
 For handling refresh failures (typical: redirect to the sign-in screen):
 
 ```sova
-authClient.installWith(
+client.installWith(
     "/api/authx/refresh",
     func() { /* onSuccess: analytics ping, cache refresh, etc */ },
     func() { navigate("/signin") }
@@ -350,20 +353,41 @@ from your handlers.
 
 **Cookie helpers.**
 
-| Function                            | Purpose                                                    |
-|-------------------------------------|------------------------------------------------------------|
-| `refreshCookieName(kit)`            | The configured cookie name.                                |
-| `refreshCookieOpts(kit)`            | `CookieOpts` for attaching the refresh cookie.             |
-| `clearRefreshCookieOpts(kit)`       | Same shape but with `maxAge = -1`. Sign-out.               |
-| `readRefreshFromRequest(kit, req)`  | Read the cookie value from a raw-wire `http.Request`.      |
+| Function                              | Purpose                                                          |
+|---------------------------------------|------------------------------------------------------------------|
+| `refreshCookieName(kit)`              | The configured cookie name.                                      |
+| `refreshCookieOpts(kit)`              | `CookieOpts` for attaching the refresh cookie (typed wires).     |
+| `clearRefreshCookieOpts(kit)`         | Same shape but with `maxAge = -1`. Sign-out (typed wires).       |
+| `readRefreshFromRequest(kit, req)`    | Read the cookie value from a raw-wire `http.Request`.            |
+| `attachRefreshCookie(kit, res, token)`| Write the refresh cookie onto a raw-wire `http.Response`.        |
+| `clearRefreshCookie(kit, res)`        | Write an expired refresh cookie onto a raw-wire `http.Response`. |
 
-**Flow primitives.**
+**Session wrappers.** These take `sessions.Session` as their first
+argument. Sova's `@` is of type `sessions.Session`, so pass `@`
+straight in from any wire handler.
+
+| Function                              | Purpose                                                          |
+|---------------------------------------|------------------------------------------------------------------|
+| `authenticate(session, principal)`    | Wrapper around `session.authenticate(subject, claims)`.          |
+| `setRoles(session, roles)`            | Wrapper around `session.setRoles(roles)`.                        |
+| `logout(session)`                     | Wrapper around `session.logout()`.                               |
+
+**Flow primitives (low-level).**
 
 | Function                                  | Purpose                                                      |
 |-------------------------------------------|--------------------------------------------------------------|
 | `mintRefresh(kit, principal, deviceLabel)`| Sign-in step: persist a Record, return plaintext token.      |
 | `tryRotate(kit, req)`                     | Refresh step: read cookie, rotate, return `TokenAndRecord`.  |
 | `revokeCurrentDevice(kit, presentedToken)`| Sign-out step: revoke this device's Record only.             |
+
+**Flow composers (high-level).** Each combines a flow primitive with
+the matching session update, so a typical handler is one call.
+
+| Function                                             | Purpose                                                          |
+|------------------------------------------------------|------------------------------------------------------------------|
+| `completeSignIn(session, kit, principal, deviceLabel)` | `mintRefresh` + `session.authenticate`. Returns plaintext token. |
+| `completeSignOut(session, kit, presentedToken)`      | `revokeCurrentDevice` + `session.logout`.                        |
+| `completeRefresh(session, kit, req, materialise)`    | `tryRotate` + `session.authenticate` (via a caller-supplied `func(refresh.Record): authx.Principal`). Returns plaintext token. |
 
 ### `authx/client`
 
@@ -564,4 +588,7 @@ tab" flow that Sova's session cookie already handles perfectly.
 
 ## License
 
-Same license as the enclosing Sova project.
+authx is released under the MIT License. See `LICENSE` at the root of
+this repository for the full text. The library is free to use,
+modify, and redistribute in commercial and non-commercial projects
+subject to the notice-preservation terms in that file.
