@@ -1,0 +1,103 @@
+package authx on shared
+
+/// authx is Sova's plug-and-play authentication scaffolding: refresh
+/// tokens with rotation, multi-device support, and a small set of
+/// building blocks that compose into whatever auth story the
+/// application needs. It intentionally does not dictate how you
+/// store users, hash passwords, or shape your claims. authx handles
+/// the parts that are mechanically the same across every application
+/// (rotation, reuse detection, cookie plumbing, silent refresh on
+/// the client) and leaves the parts that vary between applications
+/// (user model, password backend, claim payload) to you.
+///
+/// The library is intentionally small and split by concern so you
+/// can adopt one piece without the others:
+///
+///   - `authx`             : shared types passed across the boundary
+///                           (`Principal`, `TokenPair`).
+///   - `authx/refresh`     : backend-side refresh-token flow with
+///                           rotation, family invalidation, and a
+///                           `Store` interface that you implement
+///                           against whatever database you already
+///                           have.
+///   - `authx/server`      : wire-handler helpers that plug the
+///                           refresh flow into Sova's session /
+///                           `wire(authn: true)` machinery. Also
+///                           where `signIn` / `signOut` /
+///                           `handleRefresh` live.
+///   - `authx/client`      : frontend-side glue that installs an
+///                           `onUnauthorized` hook via `std/rpc` so
+///                           every wire call that hits a 401
+///                           silently tries a refresh and retries.
+///
+/// A minimal end-to-end wiring:
+///
+/// ```sova
+/// // In your backend:
+/// import "authx"
+/// import "authx/refresh"
+/// import "authx/server" as auth
+/// import "std/password"
+///
+/// // 1. Implement authx/refresh.Store against your database.
+/// type MyStore implements refresh.Store {
+///     // save / findByHash / markRevoked / revokeFamily / ...
+/// }
+///
+/// // 2. Build a Kit once at startup.
+/// let kit = auth.newKit(auth.KitConfig {
+///     refresh: refresh.Config { store: new MyStore() }
+/// })
+///
+/// // 3. Wire signIn / refresh / signOut endpoints.
+/// wire(authn: false, method: "POST", path: "/api/authx/signIn")
+/// async func signIn(email: string, plaintext: string): authx.Principal {
+///     let user = db.findUserByEmail(email) ?? return authx.Principal { }
+///     if !password.verify(plaintext, user.hash) { return authx.Principal { } }
+///     let p = authx.Principal { subject: user.id, deviceId: newDeviceId(), claims: {} }
+///     auth.signIn(kit, p)
+///     return p
+/// }
+/// ```
+
+/// Principal identifies who the user is once authenticated. `subject`
+/// is the stable identifier (typically a user id from the application
+/// database), `deviceId` groups every request from one login instance
+/// so it can be revoked separately from other logins by the same
+/// user, and `claims` carries arbitrary application-defined data that
+/// is written into Sova's session as `@.Claims` (and is available on
+/// every subsequent wire call via `@`).
+///
+/// A `Principal` with `subject == ""` is treated as "no identity" by
+/// every authx function that consumes it - a convenient sentinel for
+/// "credentials rejected" without needing to reach for `option`.
+type Principal {
+    subject: string = ""
+    deviceId: string = ""
+    claims: map<string, any> = {}
+}
+
+/// TokenPair is what `signIn` and `refresh` hand back to the caller.
+/// `refreshToken` is a one-use opaque secret the client keeps just to
+/// obtain new sessions; every use rotates it (a new value is issued
+/// and the presented one is marked spent). `refreshExpiresAtUnix` is
+/// when the presented token stops working, regardless of usage.
+///
+/// The refresh token is never stored server-side in plaintext. What
+/// authx persists via the `authx/refresh.Store` interface is only its
+/// SHA-256 hash - so even a full store dump does not let an attacker
+/// mint sessions.
+type TokenPair {
+    refreshToken: string = ""
+    refreshExpiresAtUnix: int = 0
+}
+
+/// isAnonymous reports whether `p` is the "no identity" sentinel
+/// returned by handlers that want to signal "credentials rejected"
+/// without allocating an `option<Principal>`.
+///
+/// @param p the Principal to test
+/// @returns true when the Principal carries no subject
+func isAnonymous(p: Principal): bool {
+    return p.subject == ""
+}

@@ -1,0 +1,231 @@
+package authx/server on backend
+
+import "authx"
+import "authx/refresh"
+import "std/http"
+
+/// KitConfig groups the server-side knobs the application chooses
+/// once at boot. Every field has a defensible default so the minimum
+/// wiring is `newKit(new KitConfig())` after setting `refresh.store`.
+///
+/// - `cookieName` names the HttpOnly cookie the refresh token rides
+///   in. Defaults to `authx_refresh`; change it if you already ship a
+///   cookie with that name.
+/// - `cookieMaxAgeSeconds` is how long the browser is allowed to
+///   keep the refresh cookie. Match `refresh.Config.ttlSeconds` to
+///   avoid a browser-side token that the server-side Store already
+///   considers expired (the effect is identical but the client burns
+///   a wasted refresh round-trip finding out).
+/// - `cookieSecure` should be `true` in production. Localhost dev
+///   servers on plain HTTP need it `false` or the browser refuses to
+///   send the cookie back.
+/// - `cookieSameSite` accepts `"Lax"` (default), `"Strict"`, `"None"`,
+///   or `""` (browser default). `"None"` requires `cookieSecure=true`
+///   and is intended for cross-site embedding cases; `"Lax"` covers
+///   the standard same-site SPA setup.
+type KitConfig {
+    refresh: refresh.Config
+    cookieName: string = "authx_refresh"
+    cookieMaxAgeSeconds: int = 2592000
+    cookiePath: string = "/"
+    cookieDomain: string = ""
+    cookieSecure: bool = true
+    cookieSameSite: string = "Lax"
+}
+
+/// Kit is the runtime handle callers pass to every authx/server
+/// function. Constructing a Kit is deliberately cheap: it holds no
+/// connections, spawns no goroutines, and can be created lazily at
+/// module initialisation. Share one across every wire handler that
+/// needs to consult authx state.
+type Kit {
+    cfg: KitConfig
+}
+
+/// newKit constructs a Kit from `cfg`. Provided as a factory function
+/// so future versions can perform validation or precompute derived
+/// values without changing every call site.
+///
+/// @param cfg the KitConfig to freeze into a Kit
+/// @returns the ready-to-use Kit
+func newKit(cfg: KitConfig): Kit {
+    let k = new Kit()
+    k.cfg = cfg
+    return k
+}
+
+/// refreshCookieName returns the cookie name authx uses for the
+/// refresh token. Useful when a raw handler needs to attach or clear
+/// the cookie manually via `http.Response.setCookie` without
+/// hard-coding the name.
+///
+/// @param kit the server Kit
+/// @returns the refresh cookie name
+func refreshCookieName(kit: Kit): string {
+    return kit.cfg.cookieName
+}
+
+/// refreshCookieOpts returns the `CookieOpts` used when writing the
+/// refresh cookie: HttpOnly, the configured Secure / SameSite /
+/// domain / path, and `maxAge = KitConfig.cookieMaxAgeSeconds`.
+/// Attach via `Status<T>.setCookie(name, token, opts)` or via the
+/// raw-wire equivalent.
+///
+/// @param kit the server Kit
+/// @returns cookie options for the refresh cookie
+func refreshCookieOpts(kit: Kit): http.CookieOpts {
+    let opts = http.cookieOptions(true, kit.cfg.cookieSecure, kit.cfg.cookieSameSite, kit.cfg.cookiePath, kit.cfg.cookieMaxAgeSeconds)
+    opts.domain = kit.cfg.cookieDomain
+    return opts
+}
+
+/// clearRefreshCookieOpts returns the `CookieOpts` used to instruct
+/// the browser to delete the refresh cookie. Same shape as
+/// `refreshCookieOpts` but with `maxAge = -1`, which the browser
+/// interprets as "expire immediately". Use inside sign-out handlers.
+///
+/// @param kit the server Kit
+/// @returns cookie options that clear the refresh cookie
+func clearRefreshCookieOpts(kit: Kit): http.CookieOpts {
+    let opts = http.cookieOptions(true, kit.cfg.cookieSecure, kit.cfg.cookieSameSite, kit.cfg.cookiePath, -1)
+    opts.domain = kit.cfg.cookieDomain
+    return opts
+}
+
+/// readRefreshFromRequest extracts the refresh token value from the
+/// cookie on a raw-wire request. Returns `""` when no cookie is
+/// present (or the cookie header is malformed).
+///
+/// This helper only works from a raw wire because Sova's typed
+/// wires do not expose the underlying `http.Request` to user code -
+/// the refresh endpoint has to be raw for the same reason.
+///
+/// @param kit the server Kit
+/// @param req the raw-wire request
+/// @returns the cookie value, or "" when absent
+func readRefreshFromRequest(kit: Kit, req: http.Request): string {
+    return req.cookie(kit.cfg.cookieName)
+}
+
+/// mintRefresh is the server-side building block behind a sign-in
+/// handler. Once the application has verified the caller's
+/// credentials, call `mintRefresh` to persist a Record and return
+/// the plaintext token you attach to the response cookie.
+///
+/// Returns `""` when the Store's `save` returns `none` (missing
+/// Store, database error, constraint violation). Sign-in handlers
+/// should treat that as an internal error and either surface it to
+/// the user or retry - either way, `@.authenticate(...)` should NOT
+/// be called if `mintRefresh` returned empty, because the browser
+/// will have no way to silently refresh.
+///
+/// Sign-in flow, from the handler side:
+///
+/// ```sova
+/// wire(authn: false, method: "POST", path: "/api/signIn")
+/// async func signIn(email: string, plaintext: string): std/http.Status<Ok> {
+///     let user = db.findUserByEmail(email) ?? return http.status(Ok.reject(), 401)
+///     if !password.verify(plaintext, user.hash) {
+///         return http.status(Ok.reject(), 401)
+///     }
+///     let principal = authx.Principal { subject: user.id, deviceId: uuid.v4(), claims: user.claims }
+///
+///     // In the wire handler: mint refresh, populate Sova session, attach cookie.
+///     let token = auth.mintRefresh(kit, principal, "browser")
+///     if token == "" {
+///         return http.status(Ok.reject(), 500)
+///     }
+///     @.authenticate(principal.subject, principal.claims)
+///
+///     let r = http.status(Ok.ok(), 200)
+///     r.setCookie(auth.refreshCookieName(kit), token, auth.refreshCookieOpts(kit))
+///     return r
+/// }
+/// ```
+///
+/// authx intentionally does NOT call `@.authenticate` for you - that
+/// would require this function to live inside a wire-handler body,
+/// which library code cannot express.
+///
+/// @param kit the server Kit
+/// @param principal identifies the freshly-authenticated user
+/// @param deviceLabel human-readable device label for `listDevices`
+/// @returns the plaintext refresh token, or "" on issuance failure
+func mintRefresh(kit: Kit, principal: authx.Principal, deviceLabel: string): string {
+    let tar = refresh.issue(kit.cfg.refresh, principal.subject, principal.deviceId, deviceLabel)
+    if tar == none {
+        return ""
+    }
+    return tar!.token
+}
+
+/// tryRotate implements the server side of the silent-refresh flow.
+/// It reads the presented refresh token from the request cookie,
+/// rotates it via `refresh.rotate`, and returns the new plaintext
+/// token bundled with the persisted Record. The caller then:
+///
+///   1. Uses the Record's `subject` to look up the current user
+///      state and build a fresh Principal (roles / claims may have
+///      changed since the token was originally minted).
+///   2. Calls `@.authenticate(principal.subject, principal.claims)`
+///      to update the Sova session for this response.
+///   3. Attaches the new token to the response cookie via
+///      `refreshCookieName(kit)` + `refreshCookieOpts(kit)`.
+///
+/// Returns `none` when the cookie is missing, the token is unknown
+/// or expired, or reuse detection tripped (which additionally
+/// revoked the entire family as a side effect).
+///
+/// ```sova
+/// wire(authn: false, transport: "raw", method: "POST",
+///      path: "/api/authx/refresh")
+/// async func doRefresh(req: http.Request, res: http.Response) {
+///     let outcome = auth.tryRotate(kit, req)
+///     if outcome == none {
+///         res.setStatus(401)
+///         res.setCookie(auth.refreshCookieName(kit), "", 0, true, true, "Lax", "/")
+///         return
+///     }
+///     let bundle = outcome!
+///     let user = db.findUserById(bundle.record.subject) ?? {
+///         res.setStatus(401)
+///         return
+///     }
+///     let principal = authx.Principal {
+///         subject: user!.id, deviceId: bundle.record.deviceId,
+///         claims: user!.claims
+///     }
+///     @.authenticate(principal.subject, principal.claims)
+///     res.setCookie(auth.refreshCookieName(kit), bundle.token,
+///                  kit.cfg.cookieMaxAgeSeconds, true, kit.cfg.cookieSecure,
+///                  kit.cfg.cookieSameSite, kit.cfg.cookiePath)
+/// }
+/// ```
+///
+/// @param kit the server Kit
+/// @param req the raw-wire request the client sent
+/// @returns (newToken + Record), or `none` on any failure
+func tryRotate(kit: Kit, req: http.Request): option<refresh.TokenAndRecord> {
+    let presented = readRefreshFromRequest(kit, req)
+    if presented == "" {
+        return none
+    }
+    return refresh.rotate(kit.cfg.refresh, presented)
+}
+
+/// revokeCurrentDevice is the sign-out building block. Given the
+/// refresh token the client just presented, it revokes that
+/// device's Record so the browser cannot silently reauth. The
+/// caller still needs to call `@.logout()` and attach a cleared
+/// refresh cookie in the same response.
+///
+/// Best-effort: on any Store error the function silently returns.
+///
+/// @param kit the server Kit
+/// @param presentedRefreshToken the token value from the cookie
+func revokeCurrentDevice(kit: Kit, presentedRefreshToken: string) {
+    if presentedRefreshToken == "" {
+        return
+    }
+    refresh.rotate(kit.cfg.refresh, presentedRefreshToken)
+}

@@ -1,0 +1,14 @@
+# Sova-managed directories
+.sova/
+.output/
+dist/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Local overrides (kept per-developer, never committed)
+.sova/local-links.toml

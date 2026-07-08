@@ -1,0 +1,282 @@
+package authx/refresh on backend
+
+import "std/crypto"
+import "std/random"
+import "std/time"
+
+/// Record is what a `Store` persists for each refresh token. The value
+/// of the token itself is never stored - only its SHA-256 `hash`, so a
+/// stolen store dump cannot be replayed. `family` groups every token
+/// that was rotated from the same original grant: on reuse detection
+/// (a caller presenting a token whose record is already revoked) the
+/// entire family is invalidated in one shot, so a leaked token cannot
+/// live in parallel with the legitimate rotation chain.
+///
+/// `parentId` is the id of the record this one was rotated from (empty
+/// for the initial issuance). It exists so a `Store` implementation
+/// that wants to build a per-family audit trail (which device, which
+/// browser, when) can walk the chain backwards.
+///
+/// `deviceId` is opaque to authx: the application chooses whatever
+/// identifier fits its "list my devices" story - a UUID minted at
+/// signIn, a browser fingerprint, an OS-level device id from a native
+/// client. authx never inspects it; it only carries it through
+/// rotations and exposes it in the Store's list / revoke methods.
+type Record {
+    id: string = ""
+    hash: string = ""
+    family: string = ""
+    parentId: string = ""
+    subject: string = ""
+    deviceId: string = ""
+    deviceLabel: string = ""
+    createdAtUnix: int = 0
+    expiresAtUnix: int = 0
+    revoked: bool = false
+}
+
+/// Store is the persistence adapter the application provides. authx
+/// never touches the application database directly - implement this
+/// interface against whatever storage layer already exists (SQL row,
+/// Redis hash, in-memory map, DynamoDB item) and hand an instance to
+/// `Config.store`.
+///
+/// Every method returns a total answer: `none` for "not found", `false`
+/// for "write failed / not modified". Handlers on the authx side treat
+/// any of these as "refresh failed" and surface the appropriate 401.
+/// The Store implementation is free to log its own errors, retry
+/// transient failures, or panic - authx never observes error strings.
+interface Store {
+    /// save persists a fresh `Record`, minting a stable id if
+    /// `record.id` is empty. Returns the persisted record (with its
+    /// final id populated) or `none` when the write fails.
+    ///
+    /// @param record the Record to persist
+    /// @returns the stored record with `id` set, or `none` on failure
+    func save(record: Record): option<Record>
+
+    /// findByHash locates the Record matching the SHA-256 of a caller-
+    /// presented refresh token. Callers pass the hex-encoded SHA-256,
+    /// not the raw token, so the Store never sees plaintext.
+    ///
+    /// @param hash hex SHA-256 of the presented refresh token
+    /// @returns the matching Record, or `none` when unknown
+    func findByHash(hash: string): option<Record>
+
+    /// markRevoked flips `revoked = true` on the Record with the given
+    /// id. Idempotent: revoking an already-revoked record is a no-op
+    /// success from the caller's perspective.
+    ///
+    /// @param id the Record id
+    /// @returns true when the Record exists (and is now revoked)
+    func markRevoked(id: string): bool
+
+    /// revokeFamily marks every Record with matching `family` as
+    /// revoked, in one atomic operation if the Store supports it. Used
+    /// on reuse detection to invalidate every branched-from-the-same-
+    /// grant token at once.
+    ///
+    /// @param family the family identifier
+    /// @returns true when at least one Record was revoked
+    func revokeFamily(family: string): bool
+
+    /// listByUser returns every non-revoked, non-expired Record for
+    /// `subject`. This is the raw material for a "list my devices"
+    /// endpoint - the Store returns the records, authx server code
+    /// projects them into whatever shape the frontend consumes.
+    ///
+    /// @param subject the user identifier
+    /// @returns matching Records; empty when the user has none
+    func listByUser(subject: string): []Record
+
+    /// revokeByUser marks every Record with matching `subject` as
+    /// revoked. Used for "sign out from everywhere" flows and for
+    /// invalidating sessions after a password change.
+    ///
+    /// @param subject the user identifier
+    /// @returns true when at least one Record was revoked
+    func revokeByUser(subject: string): bool
+
+    /// revokeByDevice marks every Record with matching `subject` and
+    /// `deviceId` as revoked. Used for "sign out this device" flows
+    /// initiated by an authenticated user from another device.
+    ///
+    /// @param subject the user identifier
+    /// @param deviceId the device identifier
+    /// @returns true when at least one Record was revoked
+    func revokeByDevice(subject: string, deviceId: string): bool
+}
+
+/// Config groups the tunable knobs and the Store. Passed by value to
+/// every function in this package. Construct it once at boot and
+/// carry it in your Kit.
+type Config {
+    store: option<Store> = none
+    ttlSeconds: int = 2592000
+    tokenBytes: int = 32
+}
+
+/// TokenAndRecord bundles the plaintext token (for the client) with
+/// the persisted Record (for the caller's introspection or logging).
+/// Kept as an explicit type instead of a tuple so the fields are
+/// self-documenting at call sites and so future additions (e.g., a
+/// nonce for CSRF binding) stay backwards-compatible.
+type TokenAndRecord {
+    token: string = ""
+    record: Record = new Record()
+}
+
+/// issue mints a fresh refresh token, persists a `Record` via the
+/// Store, and returns both the plaintext token (for delivery to the
+/// client) and the persisted Record (for the caller to inspect - e.g.,
+/// its id or expiry). This is the initial-issuance path; the follow-up
+/// rotations go through `rotate`.
+///
+/// The token itself is `tokenBytes` cryptographically-random bytes
+/// hex-encoded (64 characters by default). Only its SHA-256 hash is
+/// persisted; if the Store leaks, an attacker has hashes but no valid
+/// tokens.
+///
+/// Returns `none` when the Store's `save` returns `none` or when the
+/// Config has no Store. authx does not distinguish between "database
+/// down" and "constraint violation"; the caller either got a token or
+/// did not.
+///
+/// @param cfg the refresh configuration
+/// @param subject the user identifier
+/// @param deviceId opaque device identifier for this login
+/// @param deviceLabel human-readable label for "list my devices"
+/// @returns (plaintextToken, persistedRecord), or `none` on failure
+func issue(cfg: Config, subject: string, deviceId: string, deviceLabel: string): option<TokenAndRecord> {
+    if cfg.store == none {
+        return none
+    }
+    let store = cfg.store!
+    let plaintext = random.hex(cfg.tokenBytes)
+    let family = random.hex(16)
+    let now = time.instant().unix()
+    let rec = new Record()
+    rec.hash = crypto.sha256(plaintext)
+    rec.family = family
+    rec.parentId = ""
+    rec.subject = subject
+    rec.deviceId = deviceId
+    rec.deviceLabel = deviceLabel
+    rec.createdAtUnix = now
+    rec.expiresAtUnix = now + cfg.ttlSeconds
+    rec.revoked = false
+    let saved = store.save(rec)
+    if saved == none {
+        return none
+    }
+    let out = new TokenAndRecord()
+    out.token = plaintext
+    out.record = saved!
+    return out
+}
+
+/// rotate swaps the presented refresh token for a fresh pair: the
+/// presented record is marked revoked, a new record is minted with the
+/// same `family` (and its `parentId` set to the presented one), and
+/// the new plaintext token is returned.
+///
+/// On reuse detection - the presented token was already revoked - the
+/// entire family is revoked as a side effect and `none` is returned.
+/// The application should surface this to the user as "your session
+/// was terminated for security reasons" and require a fresh signIn.
+///
+/// Returns `none` when the presented token is unknown, expired,
+/// revoked (in which case the family is revoked too), or when the
+/// Store fails to persist the new record.
+///
+/// @param cfg the refresh configuration
+/// @param presented the plaintext refresh token the client sent
+/// @returns (newPlaintextToken, newRecord), or `none` on any failure
+func rotate(cfg: Config, presented: string): option<TokenAndRecord> {
+    if cfg.store == none {
+        return none
+    }
+    let store = cfg.store!
+    let hash = crypto.sha256(presented)
+    let found = store.findByHash(hash)
+    if found == none {
+        return none
+    }
+    let current = found!
+    let now = time.instant().unix()
+    if current.revoked {
+        store.revokeFamily(current.family)
+        return none
+    }
+    if current.expiresAtUnix != 0 && current.expiresAtUnix < now {
+        store.markRevoked(current.id)
+        return none
+    }
+    store.markRevoked(current.id)
+    let plaintext = random.hex(cfg.tokenBytes)
+    let rec = new Record()
+    rec.hash = crypto.sha256(plaintext)
+    rec.family = current.family
+    rec.parentId = current.id
+    rec.subject = current.subject
+    rec.deviceId = current.deviceId
+    rec.deviceLabel = current.deviceLabel
+    rec.createdAtUnix = now
+    rec.expiresAtUnix = now + cfg.ttlSeconds
+    rec.revoked = false
+    let saved = store.save(rec)
+    if saved == none {
+        return none
+    }
+    let out = new TokenAndRecord()
+    out.token = plaintext
+    out.record = saved!
+    return out
+}
+
+/// revokeByDevice hard-revokes every refresh token issued for
+/// (`subject`, `deviceId`). Use when the user picks a device from the
+/// "list my devices" UI and clicks "sign out". Note that this only
+/// stops future refreshes - any currently-valid session cookie
+/// remains live until its own expiry; pair with a session-server
+/// revoke for immediate cutoff.
+///
+/// @param cfg the refresh configuration
+/// @param subject the user identifier
+/// @param deviceId the device identifier
+/// @returns true when the Store confirmed the revocation
+func revokeByDevice(cfg: Config, subject: string, deviceId: string): bool {
+    if cfg.store == none {
+        return false
+    }
+    return cfg.store!.revokeByDevice(subject, deviceId)
+}
+
+/// revokeByUser hard-revokes every refresh token for `subject` across
+/// every device. Standard use is "sign out from everywhere" - and
+/// mandatory after a password change to prevent lingering sessions on
+/// devices the user thinks are secure.
+///
+/// @param cfg the refresh configuration
+/// @param subject the user identifier
+/// @returns true when the Store confirmed the revocation
+func revokeByUser(cfg: Config, subject: string): bool {
+    if cfg.store == none {
+        return false
+    }
+    return cfg.store!.revokeByUser(subject)
+}
+
+/// list returns every non-revoked refresh Record for `subject`. Pair
+/// with a `map` in the caller to project into a UI-friendly shape
+/// (device label, when created, whether it is the current device).
+///
+/// @param cfg the refresh configuration
+/// @param subject the user identifier
+/// @returns the user's active refresh records
+func list(cfg: Config, subject: string): []Record {
+    if cfg.store == none {
+        return []
+    }
+    return cfg.store!.listByUser(subject)
+}

@@ -1,0 +1,81 @@
+package authx/client on frontend
+
+import "std/rpc"
+
+/// authx/client is the frontend counterpart of authx/server. There is
+/// exactly one moving part: an `std/rpc.onUnauthorized` hook that
+/// silently POSTs to your refresh endpoint whenever any wire call
+/// comes back with a 401 (`state == 1`). When the refresh succeeds
+/// the runtime retries the original call transparently; when it
+/// fails a caller-supplied callback fires so the application can
+/// route the user to the sign-in screen.
+///
+/// The refresh cookie lives HttpOnly on the browser and travels
+/// automatically with every same-site request, including the retry
+/// after a successful refresh. The client itself never sees the
+/// refresh-token value, so there is nothing for the caller to store,
+/// serialise, or protect from XSS.
+///
+/// Typical wiring at boot:
+///
+/// ```sova
+/// import "authx/client" as auth
+///
+/// func boot() {
+///     auth.install("/api/authx/refresh")
+///     // for structured teardown / analytics hooks, see installWith
+/// }
+/// ```
+
+/// install registers authx/client's onUnauthorized hook with
+/// `std/rpc`, POSTing to `refreshUrl` on every 401. Returns the
+/// unregister closure from `std/rpc.onUnauthorized`. Ignoring the
+/// return value is normal - the hook stays for the page's lifetime.
+///
+/// For hooks into refresh success / failure (routing to a sign-in
+/// screen, firing analytics), use `installWith`.
+///
+/// @param refreshUrl the server endpoint that rotates the cookie
+/// @returns unregister closure
+func install(refreshUrl: string): func() {
+    return rpc.onUnauthorized(func(ctx: rpc.WireContext): bool {
+        return __postRefresh(refreshUrl)
+    })
+}
+
+/// installWith is the wide version of `install` for applications
+/// that need to react to refresh outcomes. `onSuccess` runs after
+/// each successful refresh (typically an analytics ping, or a
+/// no-op); `onFailure` runs after each unrecoverable refresh
+/// failure - use it to navigate to the sign-in screen, drop
+/// cached user state, or blank the UI.
+///
+/// The returned closure removes the hook from `std/rpc`'s chain.
+///
+/// @param refreshUrl the server endpoint that rotates the cookie
+/// @param onSuccess fires after a successful refresh
+/// @param onFailure fires when the refresh POST returned non-2xx
+/// @returns unregister closure
+func installWith(refreshUrl: string, onSuccess: func(), onFailure: func()): func() {
+    return rpc.onUnauthorized(func(ctx: rpc.WireContext): bool {
+        let ok = __postRefresh(refreshUrl)
+        if ok {
+            onSuccess()
+            return true
+        }
+        onFailure()
+        return false
+    })
+}
+
+extern {
+    /// __postRefresh is the browser-side POST that carries the
+    /// refresh cookie back to the server's refresh endpoint.
+    /// Returns true when the response was 2xx (server rotated the
+    /// cookie), false on anything else (token expired, revoked,
+    /// server down). Runs with `credentials: "include"` so the
+    /// HttpOnly refresh cookie actually travels.
+    func __postRefresh(url: string): bool = {
+        frontend: "async (u) => { try { const r = await fetch(u, { method: 'POST', credentials: 'include' }); return r.ok; } catch (_) { return false; } }"
+    }
+}
