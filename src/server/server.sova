@@ -44,7 +44,9 @@ type Kit {
 
 /// newKit constructs a Kit from `cfg`. Provided as a factory function
 /// so future versions can perform validation or precompute derived
-/// values without changing every call site.
+/// values without changing every call site. Prefer `builder(store)`
+/// for typical setups; `newKit` is the escape hatch when the
+/// application already has a fully-shaped `KitConfig` on hand.
 ///
 /// @param cfg the KitConfig to freeze into a Kit
 /// @returns the ready-to-use Kit
@@ -52,6 +54,120 @@ func newKit(cfg: KitConfig): Kit {
     let k = new Kit()
     k.cfg = cfg
     return k
+}
+
+/// Builder is the fluent constructor for `Kit`. Start from
+/// `server.builder(store)`, chain zero or more setters, and call
+/// `.build()` to freeze the Kit. Every setter returns the same
+/// Builder instance so calls compose in a single expression.
+///
+/// The builder pattern serves two purposes here: it keeps typical
+/// setups on one line (`server.builder(store).build()`), and it
+/// lets the shape of `KitConfig` evolve without churning every call
+/// site - new options just become new methods on Builder.
+type Builder {
+    cfg: KitConfig
+
+    /// refreshTtl sets how long a refresh token remains valid
+    /// server-side, in seconds. Default: 30 days.
+    func refreshTtl(seconds: int): Builder {
+        this.cfg.refresh.ttlSeconds = seconds
+        return this
+    }
+
+    /// refreshTokenBytes sets the cryptographic-random byte length
+    /// of each minted refresh token. Default: 32 bytes (64 hex
+    /// characters). Bump this only if you have a specific reason -
+    /// 256 bits is already well past collision or brute-force
+    /// concerns.
+    func refreshTokenBytes(n: int): Builder {
+        this.cfg.refresh.tokenBytes = n
+        return this
+    }
+
+    /// cookieName sets the name of the HttpOnly cookie the refresh
+    /// token rides in. Default: `"authx_refresh"`. Change it if a
+    /// pre-existing cookie in the same origin collides.
+    func cookieName(name: string): Builder {
+        this.cfg.cookieName = name
+        return this
+    }
+
+    /// cookieMaxAge sets the `Max-Age` (in seconds) the browser
+    /// keeps the refresh cookie. Should match `refreshTtl` so
+    /// client and server agree on expiry. Default: 30 days.
+    func cookieMaxAge(seconds: int): Builder {
+        this.cfg.cookieMaxAgeSeconds = seconds
+        return this
+    }
+
+    /// cookiePath sets the `Path` attribute on the refresh cookie.
+    /// Default: `"/"`. Narrow this if the refresh endpoint lives
+    /// under a specific sub-path and the cookie should not travel
+    /// to the rest of the app.
+    func cookiePath(path: string): Builder {
+        this.cfg.cookiePath = path
+        return this
+    }
+
+    /// cookieDomain sets the `Domain` attribute on the refresh
+    /// cookie. Default: `""` (same-origin only). Set to a parent
+    /// domain to share the refresh cookie across subdomains
+    /// (e.g., `.example.com`).
+    func cookieDomain(domain: string): Builder {
+        this.cfg.cookieDomain = domain
+        return this
+    }
+
+    /// cookieSecure toggles the `Secure` attribute on the refresh
+    /// cookie. Default: `true` (production-safe). Set to `false`
+    /// on localhost dev servers over plain HTTP or the browser
+    /// will refuse to send the cookie back.
+    func cookieSecure(secure: bool): Builder {
+        this.cfg.cookieSecure = secure
+        return this
+    }
+
+    /// cookieSameSite sets the `SameSite` attribute. Accepts
+    /// `"Lax"` (default), `"Strict"`, `"None"`, or `""` (browser
+    /// default). `"None"` requires `cookieSecure = true` and is
+    /// intended for cross-site embedding cases; `"Lax"` covers
+    /// the standard same-site SPA setup.
+    func cookieSameSite(sameSite: string): Builder {
+        this.cfg.cookieSameSite = sameSite
+        return this
+    }
+
+    /// build freezes the configured `KitConfig` into a `Kit` and
+    /// returns it. Call once at the end of the chain.
+    func build(): Kit {
+        return newKit(this.cfg)
+    }
+}
+
+/// builder returns a fresh `Builder` seeded with the required
+/// `Store` implementation and defensible defaults for everything
+/// else. Chain zero or more setters and call `.build()`:
+///
+/// ```sova
+/// let kit = server.builder(new MyStore())
+///     .refreshTtl(60 * 60 * 24 * 7)     // week-long refresh
+///     .cookieSecure(false)              // localhost dev
+///     .build()
+/// ```
+///
+/// @param store the refresh.Store the application provides
+/// @returns a fresh Builder pre-populated with defaults
+func builder(store: refresh.Store): Builder {
+    let cfg = new KitConfig()
+    let rc = new refresh.Config()
+    rc.store = store
+    rc.ttlSeconds = 2592000
+    rc.tokenBytes = 32
+    cfg.refresh = rc
+    let b = new Builder()
+    b.cfg = cfg
+    return b
 }
 
 /// refreshCookieName returns the cookie name authx uses for the
